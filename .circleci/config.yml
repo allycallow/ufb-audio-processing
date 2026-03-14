@@ -33,15 +33,15 @@ jobs:
           dockerfile: Dockerfile
           path: .
           region: eu-west-2
-          repo: production-ufb-airflow
+          repo: production-ufb-audio-processing
           tag: ${CIRCLE_SHA1},latest
           platform: "linux/arm64"
-      - aws-ecs/update_service:
-          cluster: production-ufb
-          container_image_name_updates: container=airflow,tag=${CIRCLE_SHA1}
-          family: production-ufb-airflow
-          force_new_deployment: true
-          region: eu-west-2
+      # - aws-ecs/update_service:
+      #     cluster: production-ufb
+      #     container_image_name_updates: container=airflow,tag=${CIRCLE_SHA1}
+      #     family: production-ufb-airflow
+      #     force_new_deployment: true
+      #     region: eu-west-2
 
 
 workflows:
