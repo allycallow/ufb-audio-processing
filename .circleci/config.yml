@@ -39,7 +39,7 @@ jobs:
           dockerfile: Dockerfile
           path: .
           region: eu-west-2
-          repo: production-audio-processing
+          repo: production-ufb-audio-processing
           tag: ${CIRCLE_SHA1},latest
           platform: "linux/arm64"
       - aws-ecs/update_service:
