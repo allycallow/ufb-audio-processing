@@ -6,6 +6,18 @@ orbs:
   aws-ecs: circleci/aws-ecs@7.2.2
 
 jobs:
+  test:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies and run tests
+          command: |
+            pip install pipenv
+            pipenv install --dev
+            pipenv run pytest
+
   build-deploy:
     docker:
       - image: cimg/aws:2025.01
@@ -19,12 +31,6 @@ jobs:
           session_duration: "1800"
       - setup_remote_docker:
           docker_layer_caching: true
-      - run:
-          name: Install dependencies and run tests
-          command: |
-            pip install pipenv
-            pipenv install --dev
-            pipenv run pytest
       - aws-ecr/build_and_push_image:
           account_id: "081077757258"
           auth:
@@ -47,5 +53,8 @@ jobs:
 workflows:
   deploy:
     jobs:
+      - test
       - build-deploy:
+          requires:
+            - test
           context: aws
