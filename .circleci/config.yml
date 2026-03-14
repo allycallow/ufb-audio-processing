@@ -46,7 +46,7 @@ jobs:
           cluster: production-ufb
           container_image_name_updates: container=audio-processing,tag=${CIRCLE_SHA1}
           family: production-ufb-audio-processing
-          force_new_deployment: true
+          force_new_deployment: false
           region: eu-west-2
 
 
