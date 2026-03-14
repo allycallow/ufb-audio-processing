@@ -42,11 +42,12 @@ jobs:
           repo: production-ufb-audio-processing
           tag: ${CIRCLE_SHA1},latest
           platform: "linux/arm64"
-      - aws-ecs/update_service:
-          cluster: production-ufb
+      - aws-ecs/update_task_definition:
+          auth:
+            - aws-cli/setup:
+                role_arn: arn:aws:iam::081077757258:role/openid-connect-circleci
           container_image_name_updates: container=audio-processing,tag=${CIRCLE_SHA1}
           family: production-ufb-audio-processing
-          force_new_deployment: false
           region: eu-west-2
 
 
