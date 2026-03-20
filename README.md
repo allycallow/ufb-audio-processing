@@ -54,6 +54,7 @@ docker run --rm \
   -e DRM_KEY_SERVER_URL=https://drm.example.com \
   -e AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_SESSION_TOKEN \
   ufb-audio-processing
 ```
 

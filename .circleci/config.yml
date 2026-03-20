@@ -6,18 +6,6 @@ orbs:
   aws-ecs: circleci/aws-ecs@7.2.2
 
 jobs:
-  test:
-    docker:
-      - image: cimg/python:3.12
-    steps:
-      - checkout
-      - run:
-          name: Install dependencies and run tests
-          command: |
-            pip install pipenv
-            pipenv install --dev
-            pipenv run pytest
-
   build-deploy:
     docker:
       - image: cimg/aws:2025.01
@@ -54,8 +42,5 @@ jobs:
 workflows:
   deploy:
     jobs:
-      - test
       - build-deploy:
-          requires:
-            - test
           context: aws

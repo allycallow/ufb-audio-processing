@@ -1,66 +1,78 @@
+import contextlib
+import logging
 import os
-import sys
 import subprocess
 import tempfile
-import logging
-import boto3
-import base64
 
-# Setup logging for AWS ECS
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+import boto3
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("CMAF_Packager")
+
+# --- EZDRM key material ---
+KID_HEX = "a5814b403ac0457398e8aa98f178dc8c"
+KEY_HEX = "67d3a4de738aa26e069b23268720d365"
+PSSH_HEX = (
+    "0000003f7073736800000000edef8ba979d64ace83c827dcd51d21ed"
+    "0000001f1210a5814b403ac0457398e8aa98f178dc8c1a05657a64726d48e3dc959b06"
+)
+
+SEGMENT_DURATION = 5  # seconds — explicit, not relying on packager default
+
+
+# --- Bug fix #1: context manager guarantees cwd restoration on any exit path ---
+@contextlib.contextmanager
+def working_directory(path: str):
+    original = os.getcwd()
+    try:
+        os.chdir(path)
+        yield
+    finally:
+        os.chdir(original)
 
 
 def download_from_s3(bucket: str, key: str, dest: str) -> None:
-    """Downloads the source WAV file from S3."""
     s3 = boto3.client("s3")
-    logger.info(f"Downloading s3://{bucket}/{key} to {dest}")
+    logger.info("ACTION: Downloading s3://%s/%s", bucket, key)
     s3.download_file(bucket, key, dest)
 
 
 def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str) -> None:
-    """Uploads the encrypted CMAF segments and manifests back to S3."""
     s3 = boto3.client("s3")
+    content_types = {
+        ".m3u8": "application/x-mpegURL",
+        ".mpd": "application/dash+xml",
+        ".m4s": "video/iso.segment",
+        ".mp4": "video/mp4",
+    }
     for root, _, files in os.walk(local_dir):
         for filename in files:
             local_path = os.path.join(root, filename)
-            s3_key = f"{prefix}/{os.path.relpath(local_path, local_dir)}"
+            rel_path = os.path.relpath(local_path, local_dir)
+            s3_key = f"{prefix}/{rel_path}"
+            ext = os.path.splitext(filename)[1].lower()
+            ct = content_types.get(ext, "application/octet-stream")
 
-            if filename.endswith(".m3u8"):
-                content_type = "application/x-mpegURL"
-            elif filename.endswith(".mpd"):
-                content_type = "application/dash+xml"
-            else:
-                content_type = "application/mp4"
-
+            logger.info("UPLOAD: %s → s3://%s/%s [%s]", rel_path, bucket, s3_key, ct)
             s3.upload_file(
-                local_path, bucket, s3_key, ExtraArgs={"ContentType": content_type}
+                local_path,
+                bucket,
+                s3_key,
+                ExtraArgs={"ContentType": ct},
             )
-    logger.info(f"Upload complete to s3://{bucket}/{prefix}")
 
 
-def process_universal_cmaf(wav_path: str, output_dir: str, content_id: str):
-    """
-    Step 1: Transcode WAV to Lossless FLAC in an MP4 container.
-    Step 2: Package & Encrypt using Shaka Packager (Raw Keys).
-    """
-
-    # --- DATA FROM YOUR LATEST EZDRM XML RESPONSE ---
-    ezdrm_kid_guid = "a5814b40-3ac0-4573-98e8-aa98f178dc8c"
-    ezdrm_key_b64 = "Z9Ok3nOKom4GmyMmhyDTZQ=="
-    ezdrm_pssh_b64 = "AAAAP3Bzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAAB8SEKWBS0A6wEVzmOiqmPF43IwaBWV6ZHJtSOPclZsG"
-
-    # --- FORMAT CONVERSIONS ---
-    key_id_hex = ezdrm_kid_guid.replace("-", "")
-    key_hex = base64.b64decode(ezdrm_key_b64).hex()
-    pssh_hex = base64.b64decode(ezdrm_pssh_b64).hex()
-
+def process_universal_cmaf(wav_path: str, output_dir: str) -> None:
     label = "lossless"
-    intermediate_container = os.path.join(output_dir, f"{label}_temp.mp4")
+    variant_dir = os.path.join(output_dir, label)
+    os.makedirs(variant_dir, exist_ok=True)
 
-    # --- STEP 1: ENCODE WAV TO LOSSLESS FLAC ---
-    logger.info(f"Transcoding WAV to {label} variant...")
-    # Using 16-bit/44.1kHz to match your source audio logs exactly
+    intermediate = os.path.join(output_dir, "temp_flac.mp4")
+
+    # 1. Transcode WAV → FLAC inside a CMAF-compatible MP4 container
+    logger.info("FFMPEG: Encoding WAV → FLAC CMAF...")
     subprocess.run(
         [
             "ffmpeg",
@@ -74,76 +86,99 @@ def process_universal_cmaf(wav_path: str, output_dir: str, content_id: str):
             "-ar",
             "44100",
             "-y",
-            intermediate_container,
+            intermediate,
         ],
         check=True,
     )
 
-    # --- STEP 2: DEFINE SHAKA INPUT ---
-    os.makedirs(os.path.join(output_dir, label), exist_ok=True)
-    # Note: dash_label remains 'lossless' for the manifest name,
-    # but the DRM system will now look for the 'AUDIO' key.
+    # 2. Package with shaka-packager
+    #
+    # We chdir into variant_dir so the packager writes init.mp4 / seg_N.m4s
+    # there with flat (no-subdirectory) paths.  main.m3u8 then references
+    # segments as bare filenames, avoiding 404s when CloudFront serves
+    # from the cmaf/lossless/ prefix.
+    #
+    # Output layout after packaging:
+    #   output_dir/
+    #     master.m3u8        ← HLS master playlist  (--hls_master_playlist_output)
+    #     manifest.mpd       ← DASH manifest         (--mpd_output)
+    #     lossless/
+    #       main.m3u8        ← HLS variant playlist
+    #       init.mp4         ← CMAF init segment
+    #       seg_1.m4s ...    ← CMAF media segments
+
     input_spec = (
-        f"input={intermediate_container},stream=audio,"
-        f"init_segment={label}/init.mp4,"
-        f"segment_template={label}/seg_$Number$.m4s,"
-        f"playlist_name={label}/main.m3u8,"
-        f"dash_label={label}"
+        f"input={intermediate},stream=audio,"
+        f"init_segment=init.mp4,"
+        f"segment_template=seg_$Number$.m4s,"
+        f"playlist_name=main.m3u8,"
+        f"hls_group_id=audio,hls_name={label}"
     )
 
-    # --- STEP 3: ENCRYPT & PACKAGE ---
-    master_hls = os.path.join(output_dir, "master.m3u8")
-    master_dash = os.path.join(output_dir, "manifest.mpd")
-
-    # FIXED: Changed label=lossless to label=AUDIO to match Shaka's internal stream detection
     packager_cmd = [
         "packager",
         input_spec,
         "--enable_raw_key_encryption",
         "--keys",
-        f"label=AUDIO:key_id={key_id_hex}:key={key_hex}",
+        f"label=AUDIO:key_id={KID_HEX}:key={KEY_HEX}",
         "--pssh",
-        pssh_hex,
+        PSSH_HEX,
         "--protection_scheme",
         "cbcs",
         "--protection_systems",
         "Widevine",
+        "--segment_duration",
+        str(SEGMENT_DURATION),
         "--clear_lead",
         "0",
         "--hls_master_playlist_output",
-        master_hls,
+        "../master.m3u8",
         "--mpd_output",
-        master_dash,
+        "../manifest.mpd",
     ]
 
-    logger.info(f"Starting Shaka Packaging (KID: {key_id_hex})")
-    subprocess.run(packager_cmd, check=True)
+    # Bug fix #1: guaranteed cwd restoration even if packager raises
+    with working_directory(variant_dir):
+        logger.info("PACKAGER: Running from %s", variant_dir)
+        subprocess.run(packager_cmd, check=True)
 
-    # Cleanup intermediate container
-    os.remove(intermediate_container)
+    os.remove(intermediate)
+    logger.info("PACKAGER: Done. Removed intermediate %s", intermediate)
 
 
-def main():
+def main() -> None:
+    # Bug fix #5: fail fast with a clear message if env vars are absent
     s3_bucket = os.environ.get("S3_BUCKET")
     s3_key = os.environ.get("S3_KEY")
-    content_id = os.environ.get("CONTENT_ID", "default_id")
-
     if not s3_bucket or not s3_key:
-        logger.error("S3_BUCKET or S3_KEY environment variables are missing.")
-        sys.exit(1)
+        raise EnvironmentError(
+            "S3_BUCKET and S3_KEY environment variables must both be set. "
+            f"Got: S3_BUCKET={s3_bucket!r}, S3_KEY={s3_key!r}"
+        )
 
-    output_prefix = f"{os.path.dirname(s3_key)}/cmaf"
+    # Bug fix #2: derive the output prefix from the key structure explicitly.
+    # S3_KEY is expected to be   audio/{track_id}/original.wav
+    # Output prefix becomes      audio/{track_id}/cmaf
+    # This is explicit rather than relying on dirname not stripping too much.
+    key_parts = s3_key.split("/")
+    if len(key_parts) < 3:
+        raise ValueError(
+            f"S3_KEY must be at least 3 path segments deep (e.g. audio/{{id}}/file.wav). "
+            f"Got: {s3_key!r}"
+        )
+    output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
+    logger.info("Output prefix: s3://%s/%s", s3_bucket, output_prefix)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.wav")
+        input_path = os.path.join(tmpdir, "in.wav")
         output_path = os.path.join(tmpdir, "out")
         os.makedirs(output_path)
 
         download_from_s3(s3_bucket, s3_key, input_path)
-        process_universal_cmaf(input_path, output_path, content_id)
+        process_universal_cmaf(input_path, output_path)
         upload_directory_to_s3(output_path, s3_bucket, output_prefix)
 
-    logger.info("Task completed successfully.")
+    logger.info("TASK COMPLETED SUCCESSFULLY")
 
 
 if __name__ == "__main__":
