@@ -7,8 +7,10 @@ orbs:
 
 jobs:
   build-deploy:
-    docker:
-      - image: cimg/aws:2025.01
+    machine:
+      image: ubuntu-2204:2024.01.1
+      docker_layer_caching: true
+    resource_class: arm.medium
     steps:
       - checkout
       - aws-cli/setup:
@@ -17,8 +19,9 @@ jobs:
           profile_name: "OIDC-PROFILE"
           role_session_name: "example-session"
           session_duration: "1800"
-      - setup_remote_docker:
-          docker_layer_caching: true
+
+      # setup_remote_docker is removed (not used with machine executors)
+
       - aws-ecr/build_and_push_image:
           account_id: "081077757258"
           auth:
@@ -28,16 +31,17 @@ jobs:
           path: .
           region: eu-west-2
           repo: production-ufb-audio-processing
-          tag: ${CIRCLE_SHA1},latest
+          tag: "${CIRCLE_SHA1},latest"
           platform: "linux/arm64"
+          # Extra safety for heavy audio-processing builds
+          no_output_timeout: 20m
+
       - aws-ecs/update_service:
           cluster: production-ufb
           family: production-audio-processing
           container_image_name_updates: "container=audio-processing,tag=${CIRCLE_SHA1}"
           force_new_deployment: false
           region: eu-west-2
-
-
 
 workflows:
   deploy:
