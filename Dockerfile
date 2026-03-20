@@ -3,8 +3,8 @@
 FROM google/shaka-packager:v3.6.0
 
 
-# Install Python, boto3, pytest, ffmpeg, and other dependencies (Alpine Linux)
-RUN apk add --no-cache python3 py3-pip py3-virtualenv ffmpeg ca-certificates py3-boto3 py3-pytest
+# Install Python, boto3, pytest, ffmpeg, and other dependencies (Alpine Linux)i
+RUN apk add --no-cache python3 py3-pip py3-virtualenv ffmpeg ca-certificates py3-boto3 py3-pytest py3-requests
 
 WORKDIR /app
 

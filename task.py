@@ -1,28 +1,26 @@
-import contextlib
-import logging
 import os
+import sys
 import subprocess
 import tempfile
-
+import logging
+import contextlib
+import xml.etree.ElementTree as ET
+import base64
+import binascii
+import requests
 import boto3
+import uuid
 
+# --- LOGGING CONFIGURATION ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("CMAF_Packager")
 
-# --- EZDRM key material ---
-KID_HEX = "a5814b403ac0457398e8aa98f178dc8c"
-KEY_HEX = "67d3a4de738aa26e069b23268720d365"
-PSSH_HEX = (
-    "0000003f7073736800000000edef8ba979d64ace83c827dcd51d21ed"
-    "0000001f1210a5814b403ac0457398e8aa98f178dc8c1a05657a64726d48e3dc959b06"
-)
-
-SEGMENT_DURATION = 5  # seconds — explicit, not relying on packager default
+SEGMENT_DURATION = 5
 
 
-# --- Bug fix #1: context manager guarantees cwd restoration on any exit path ---
+# --- Bug fix #1: context manager guarantees cwd restoration ---
 @contextlib.contextmanager
 def working_directory(path: str):
     original = os.getcwd()
@@ -31,6 +29,40 @@ def working_directory(path: str):
         yield
     finally:
         os.chdir(original)
+
+
+def fetch_ezdrm_keys(content_id, kid_guid, username, password):
+    """
+    Dynamically fetches KID_HEX, KEY_HEX, and PSSH_HEX from EZDRM CPIX API.
+    """
+    url = f"https://cpix.ezdrm.com/keygenerator/cpix.aspx?k={kid_guid}&u={username}&p={password}&c={content_id}"
+    logger.info("EZDRM: Fetching keys from CPIX API...")
+
+    response = requests.get(url)
+    response.raise_for_status()
+
+    # Namespaces for CPIX XML parsing
+    ns = {"cpix": "urn:dashif:org:cpix", "pskc": "urn:ietf:params:xml:ns:keyprov:pskc"}
+
+    root = ET.fromstring(response.content)
+
+    # 1. Extract KID_HEX (Strip dashes from GUID)
+    raw_kid = root.find(".//cpix:ContentKey", ns).get("kid")
+    kid_hex = raw_kid.replace("-", "").lower()
+
+    # 2. Extract KEY_HEX (Decode Base64 PlainValue)
+    base64_key = root.find(".//pskc:PlainValue", ns).text
+    key_hex = binascii.hexlify(base64.b64decode(base64_key)).decode("utf-8")
+
+    # 3. Extract PSSH_HEX (Widevine System ID: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed)
+    widevine_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+    base64_pssh = root.find(
+        f".//cpix:DRMSystem[@systemId='{widevine_id}']/cpix:PSSH", ns
+    ).text
+    pssh_hex = binascii.hexlify(base64.b64decode(base64_pssh)).decode("utf-8")
+
+    logger.info("EZDRM: Keys successfully rotated/fetched.")
+    return kid_hex, key_hex, pssh_hex
 
 
 def download_from_s3(bucket: str, key: str, dest: str) -> None:
@@ -55,24 +87,18 @@ def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str) -> None:
             ext = os.path.splitext(filename)[1].lower()
             ct = content_types.get(ext, "application/octet-stream")
 
-            logger.info("UPLOAD: %s → s3://%s/%s [%s]", rel_path, bucket, s3_key, ct)
-            s3.upload_file(
-                local_path,
-                bucket,
-                s3_key,
-                ExtraArgs={"ContentType": ct},
-            )
+            s3.upload_file(local_path, bucket, s3_key, ExtraArgs={"ContentType": ct})
 
 
-def process_universal_cmaf(wav_path: str, output_dir: str) -> None:
+def process_universal_cmaf(wav_path: str, output_dir: str, drm_keys: tuple) -> None:
+    kid_hex, key_hex, pssh_hex = drm_keys
     label = "lossless"
     variant_dir = os.path.join(output_dir, label)
     os.makedirs(variant_dir, exist_ok=True)
 
     intermediate = os.path.join(output_dir, "temp_flac.mp4")
 
-    # 1. Transcode WAV → FLAC inside a CMAF-compatible MP4 container
-    logger.info("FFMPEG: Encoding WAV → FLAC CMAF...")
+    # 1. Transcode WAV → FLAC
     subprocess.run(
         [
             "ffmpeg",
@@ -92,21 +118,6 @@ def process_universal_cmaf(wav_path: str, output_dir: str) -> None:
     )
 
     # 2. Package with shaka-packager
-    #
-    # We chdir into variant_dir so the packager writes init.mp4 / seg_N.m4s
-    # there with flat (no-subdirectory) paths.  main.m3u8 then references
-    # segments as bare filenames, avoiding 404s when CloudFront serves
-    # from the cmaf/lossless/ prefix.
-    #
-    # Output layout after packaging:
-    #   output_dir/
-    #     master.m3u8        ← HLS master playlist  (--hls_master_playlist_output)
-    #     manifest.mpd       ← DASH manifest         (--mpd_output)
-    #     lossless/
-    #       main.m3u8        ← HLS variant playlist
-    #       init.mp4         ← CMAF init segment
-    #       seg_1.m4s ...    ← CMAF media segments
-
     input_spec = (
         f"input={intermediate},stream=audio,"
         f"init_segment=init.mp4,"
@@ -120,9 +131,9 @@ def process_universal_cmaf(wav_path: str, output_dir: str) -> None:
         input_spec,
         "--enable_raw_key_encryption",
         "--keys",
-        f"label=AUDIO:key_id={KID_HEX}:key={KEY_HEX}",
+        f"label=AUDIO:key_id={kid_hex}:key={key_hex}",
         "--pssh",
-        PSSH_HEX,
+        pssh_hex,
         "--protection_scheme",
         "cbcs",
         "--protection_systems",
@@ -137,37 +148,37 @@ def process_universal_cmaf(wav_path: str, output_dir: str) -> None:
         "../manifest.mpd",
     ]
 
-    # Bug fix #1: guaranteed cwd restoration even if packager raises
     with working_directory(variant_dir):
-        logger.info("PACKAGER: Running from %s", variant_dir)
         subprocess.run(packager_cmd, check=True)
 
     os.remove(intermediate)
-    logger.info("PACKAGER: Done. Removed intermediate %s", intermediate)
 
 
 def main() -> None:
-    # Bug fix #5: fail fast with a clear message if env vars are absent
+    # Environment Variables
     s3_bucket = os.environ.get("S3_BUCKET")
     s3_key = os.environ.get("S3_KEY")
-    if not s3_bucket or not s3_key:
-        raise EnvironmentError(
-            "S3_BUCKET and S3_KEY environment variables must both be set. "
-            f"Got: S3_BUCKET={s3_bucket!r}, S3_KEY={s3_key!r}"
-        )
+    ez_user = os.environ.get("EZDRM_USER")
+    ez_pass = os.environ.get("EZDRM_PASS")
+    content_id = os.environ.get("CONTENT_ID")
+    kid_guid = str(uuid.uuid4())
 
-    # Bug fix #2: derive the output prefix from the key structure explicitly.
-    # S3_KEY is expected to be   audio/{track_id}/original.wav
-    # Output prefix becomes      audio/{track_id}/cmaf
-    # This is explicit rather than relying on dirname not stripping too much.
+    logger.info(
+        f"TASK STARTED: Processing {s3_key} with KID {kid_guid} and Content ID {content_id}"
+    )
+
+    # Derive IDs from S3 Key: audio/{id}/original.wav
     key_parts = s3_key.split("/")
-    if len(key_parts) < 3:
-        raise ValueError(
-            f"S3_KEY must be at least 3 path segments deep (e.g. audio/{{id}}/file.wav). "
-            f"Got: {s3_key!r}"
-        )
     output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
-    logger.info("Output prefix: s3://%s/%s", s3_bucket, output_prefix)
+
+    # Fetch dynamic keys (Using your provided GUID for the KID)
+    # Note: In production, track_id and kid_guid might be the same or linked
+    drm_keys = fetch_ezdrm_keys(
+        content_id=content_id,
+        kid_guid=kid_guid,
+        username=ez_user,
+        password=ez_pass,
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "in.wav")
@@ -175,7 +186,7 @@ def main() -> None:
         os.makedirs(output_path)
 
         download_from_s3(s3_bucket, s3_key, input_path)
-        process_universal_cmaf(input_path, output_path)
+        process_universal_cmaf(input_path, output_path, drm_keys)
         upload_directory_to_s3(output_path, s3_bucket, output_prefix)
 
     logger.info("TASK COMPLETED SUCCESSFULLY")
