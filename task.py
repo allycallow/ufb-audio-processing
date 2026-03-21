@@ -8,6 +8,7 @@ import binascii
 import contextlib
 import tempfile
 import boto3
+import uuid
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -198,7 +199,7 @@ def main():
     s3_bucket = os.environ["S3_BUCKET"]
     s3_key = os.environ["S3_KEY"]
 
-    kid_guid = os.environ["KID_GUID"]
+    kid_guid = str(uuid.uuid4())
     ez_user = os.environ["EZDRM_USER"]
     ez_pass = os.environ["EZDRM_PASS"]
 
