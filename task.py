@@ -1,26 +1,30 @@
 import os
-import sys
 import subprocess
-import tempfile
 import logging
-import contextlib
+import requests
 import xml.etree.ElementTree as ET
 import base64
 import binascii
-import requests
+import contextlib
+import tempfile
 import boto3
-import uuid
 
-# --- LOGGING CONFIGURATION ---
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("CMAF_Packager")
+logger = logging.getLogger("ABR_Packager")
 
 SEGMENT_DURATION = 5
 
+# ABR ladder
+VARIANTS = [
+    {"label": "high", "bitrate": "320k", "bandwidth": 320000},
+    {"label": "med", "bitrate": "192k", "bandwidth": 192000},
+    {"label": "low", "bitrate": "64k", "bandwidth": 64000},
+]
 
-# --- Bug fix #1: context manager guarantees cwd restoration ---
+
 @contextlib.contextmanager
 def working_directory(path: str):
     original = os.getcwd()
@@ -31,165 +35,198 @@ def working_directory(path: str):
         os.chdir(original)
 
 
-def fetch_ezdrm_keys(content_id, kid_guid, username, password):
-    """
-    Dynamically fetches KID_HEX, KEY_HEX, and PSSH_HEX from EZDRM CPIX API.
-    """
-    url = f"https://cpix.ezdrm.com/keygenerator/cpix.aspx?k={kid_guid}&u={username}&p={password}&c={content_id}"
-    logger.info("EZDRM: Fetching keys from CPIX API...")
+# ---------------- DRM ---------------- #
 
-    response = requests.get(url)
+
+def fetch_ezdrm_keys(content_id: str, kid_guid: str, username: str, password: str):
+    """Fetch Widevine keys from EZDRM CPIX API."""
+
+    url = (
+        f"https://cpix.ezdrm.com/keygenerator/cpix.aspx"
+        f"?k={kid_guid}&u={username}&p={password}&c={content_id}"
+    )
+
+    logger.info("Fetching DRM keys from EZDRM")
+
+    response = requests.get(url, timeout=15)
     response.raise_for_status()
 
-    # Namespaces for CPIX XML parsing
     ns = {"cpix": "urn:dashif:org:cpix", "pskc": "urn:ietf:params:xml:ns:keyprov:pskc"}
 
     root = ET.fromstring(response.content)
 
-    # 1. Extract KID_HEX (Strip dashes from GUID)
     raw_kid = root.find(".//cpix:ContentKey", ns).get("kid")
     kid_hex = raw_kid.replace("-", "").lower()
 
-    # 2. Extract KEY_HEX (Decode Base64 PlainValue)
     base64_key = root.find(".//pskc:PlainValue", ns).text
-    key_hex = binascii.hexlify(base64.b64decode(base64_key)).decode("utf-8")
+    key_hex = binascii.hexlify(base64.b64decode(base64_key)).decode()
 
-    # 3. Extract PSSH_HEX (Widevine System ID: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed)
     widevine_id = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+
     base64_pssh = root.find(
         f".//cpix:DRMSystem[@systemId='{widevine_id}']/cpix:PSSH", ns
     ).text
-    pssh_hex = binascii.hexlify(base64.b64decode(base64_pssh)).decode("utf-8")
 
-    logger.info("EZDRM: Keys successfully rotated/fetched.")
+    pssh_hex = binascii.hexlify(base64.b64decode(base64_pssh)).decode()
+
+    logger.info("DRM keys retrieved successfully")
+
     return kid_hex, key_hex, pssh_hex
 
 
-def download_from_s3(bucket: str, key: str, dest: str) -> None:
-    s3 = boto3.client("s3")
-    logger.info("ACTION: Downloading s3://%s/%s", bucket, key)
-    s3.download_file(bucket, key, dest)
+# ---------------- S3 Upload ---------------- #
 
 
-def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str) -> None:
+def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str):
+
     s3 = boto3.client("s3")
+
     content_types = {
-        ".m3u8": "application/x-mpegURL",
+        ".m3u8": "application/vnd.apple.mpegurl",
         ".mpd": "application/dash+xml",
         ".m4s": "video/iso.segment",
         ".mp4": "video/mp4",
     }
+
     for root, _, files in os.walk(local_dir):
         for filename in files:
+
             local_path = os.path.join(root, filename)
             rel_path = os.path.relpath(local_path, local_dir)
+
             s3_key = f"{prefix}/{rel_path}"
+
             ext = os.path.splitext(filename)[1].lower()
             ct = content_types.get(ext, "application/octet-stream")
+
+            logger.info("Uploading %s → s3://%s/%s", filename, bucket, s3_key)
 
             s3.upload_file(local_path, bucket, s3_key, ExtraArgs={"ContentType": ct})
 
 
-def process_universal_cmaf(wav_path: str, output_dir: str, drm_keys: tuple) -> None:
+# ---------------- Packaging ---------------- #
+
+
+def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple):
+
     kid_hex, key_hex, pssh_hex = drm_keys
-    label = "lossless"
-    variant_dir = os.path.join(output_dir, label)
-    os.makedirs(variant_dir, exist_ok=True)
 
-    intermediate = os.path.join(output_dir, "temp_flac.mp4")
+    packager_inputs = []
 
-    # 1. Transcode WAV → FLAC
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-i",
-            wav_path,
-            "-vn",
-            "-c:a",
-            "flac",
-            "-sample_fmt",
-            "s16",
-            "-ar",
-            "44100",
-            "-y",
-            intermediate,
-        ],
-        check=True,
+    for v in VARIANTS:
+
+        logger.info("Encoding %s variant (%s)", v["label"], v["bitrate"])
+
+        variant_dir = os.path.join(output_dir, v["label"])
+        os.makedirs(variant_dir, exist_ok=True)
+
+        temp_file = os.path.join(output_dir, f"temp_{v['label']}.mp4")
+
+        # --- Encode audio ---
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                wav_path,
+                "-vn",
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                v["bitrate"],
+                "-minrate",
+                v["bitrate"],
+                "-maxrate",
+                v["bitrate"],
+                "-bufsize",
+                str(int(v["bandwidth"]) * 2),
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                temp_file,
+            ],
+            check=True,
+        )
+
+        # --- Packager input spec ---
+        packager_inputs.append(
+            f"input={temp_file},stream=audio,"
+            f"bandwidth={v['bandwidth']},"
+            f"init_segment={v['label']}/init.mp4,"
+            f"segment_template={v['label']}/seg_$Number$.m4s,"
+            f"playlist_name={v['label']}/main.m3u8"
+        )
+
+    packager_cmd = (
+        ["packager"]
+        + packager_inputs
+        + [
+            "--enable_raw_key_encryption",
+            "--keys",
+            f"label=AUDIO:key_id={kid_hex}:key={key_hex}",
+            "--pssh",
+            pssh_hex,
+            "--protection_scheme",
+            "cbcs",
+            "--segment_duration",
+            str(SEGMENT_DURATION),
+            "--clear_lead",
+            "0",
+            "--hls_master_playlist_output",
+            "master.m3u8",
+            "--mpd_output",
+            "manifest.mpd",
+        ]
     )
 
-    # 2. Package with shaka-packager
-    input_spec = (
-        f"input={intermediate},stream=audio,"
-        f"init_segment=init.mp4,"
-        f"segment_template=seg_$Number$.m4s,"
-        f"playlist_name=main.m3u8,"
-        f"hls_group_id=audio,hls_name={label}"
-    )
+    logger.info("Running Shaka Packager")
 
-    packager_cmd = [
-        "packager",
-        input_spec,
-        "--enable_raw_key_encryption",
-        "--keys",
-        f"label=AUDIO:key_id={kid_hex}:key={key_hex}",
-        "--pssh",
-        pssh_hex,
-        "--protection_scheme",
-        "cbcs",
-        "--protection_systems",
-        "Widevine",
-        "--segment_duration",
-        str(SEGMENT_DURATION),
-        "--clear_lead",
-        "0",
-        "--hls_master_playlist_output",
-        "../master.m3u8",
-        "--mpd_output",
-        "../manifest.mpd",
-    ]
-
-    with working_directory(variant_dir):
+    with working_directory(output_dir):
         subprocess.run(packager_cmd, check=True)
 
-    os.remove(intermediate)
+    logger.info("Packaging completed")
 
 
-def main() -> None:
-    # Environment Variables
-    s3_bucket = os.environ.get("S3_BUCKET")
-    s3_key = os.environ.get("S3_KEY")
-    ez_user = os.environ.get("EZDRM_USER")
-    ez_pass = os.environ.get("EZDRM_PASS")
-    content_id = os.environ.get("CONTENT_ID")
-    kid_guid = str(uuid.uuid4())
+# ---------------- Main ---------------- #
 
-    logger.info(
-        f"TASK STARTED: Processing {s3_key} with KID {kid_guid} and Content ID {content_id}"
-    )
 
-    # Derive IDs from S3 Key: audio/{id}/original.wav
+def main():
+
+    s3_bucket = os.environ["S3_BUCKET"]
+    s3_key = os.environ["S3_KEY"]
+
+    kid_guid = os.environ["KID_GUID"]
+    ez_user = os.environ["EZDRM_USER"]
+    ez_pass = os.environ["EZDRM_PASS"]
+
     key_parts = s3_key.split("/")
+    track_id = key_parts[1]
+
     output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
 
-    # Fetch dynamic keys (Using your provided GUID for the KID)
-    # Note: In production, track_id and kid_guid might be the same or linked
-    drm_keys = fetch_ezdrm_keys(
-        content_id=content_id,
-        kid_guid=kid_guid,
-        username=ez_user,
-        password=ez_pass,
-    )
+    logger.info("Processing track %s", track_id)
+
+    drm_keys = fetch_ezdrm_keys(track_id, kid_guid, ez_user, ez_pass)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "in.wav")
-        output_path = os.path.join(tmpdir, "out")
+
+        input_path = os.path.join(tmpdir, "input.wav")
+        output_path = os.path.join(tmpdir, "output")
+
         os.makedirs(output_path)
 
-        download_from_s3(s3_bucket, s3_key, input_path)
-        process_universal_cmaf(input_path, output_path, drm_keys)
+        logger.info("Downloading source from S3")
+
+        boto3.client("s3").download_file(s3_bucket, s3_key, input_path)
+
+        process_abr_cmaf(input_path, output_path, drm_keys)
+
         upload_directory_to_s3(output_path, s3_bucket, output_prefix)
 
-    logger.info("TASK COMPLETED SUCCESSFULLY")
+    logger.info("ABR packaging task completed successfully")
 
 
 if __name__ == "__main__":
