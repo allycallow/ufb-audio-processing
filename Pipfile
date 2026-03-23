@@ -1,0 +1,19 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+
+[dev-packages]
+flake8 = "*"
+black = "*"
+isort = "*"
+
+[scripts]
+lint = "flake8 ."
+format = "black ."
+sort-imports = "isort ."
+
+[requires]
+python_version = "3.12"

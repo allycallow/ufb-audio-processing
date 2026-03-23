@@ -1,14 +1,15 @@
-import os
-import subprocess
-import logging
-import requests
-import xml.etree.ElementTree as ET
 import base64
 import binascii
 import contextlib
+import logging
+import os
+import subprocess
 import tempfile
-import boto3
 import uuid
+import xml.etree.ElementTree as ET
+
+import boto3
+import requests
 
 # --- LOGGING ---
 logging.basicConfig(
