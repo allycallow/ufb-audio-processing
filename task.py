@@ -75,6 +75,63 @@ def fetch_ezdrm_keys(content_id: str, kid_guid: str, username: str, password: st
     return kid_hex, key_hex, pssh_hex
 
 
+def _validate_clearkey_hex(name: str, value: str) -> str:
+    value = value.strip().lower()
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a hex string, got: {value!r}") from None
+    if len(raw) != 16:
+        raise ValueError(
+            f"{name} must be 16 bytes (32 hex chars) for AES-128, got {len(raw)} bytes"
+        )
+    return value
+
+
+def generate_clearkey_keys(content_id: str):
+    """Return a key_id/key pair for local ClearKey testing.
+
+    If CLEARKEY_KEY_ID and CLEARKEY_KEY are both set, those fixed values
+    are used — handy for pinning one key across every dev run so the
+    frontend's ClearKey config doesn't need updating per track. Otherwise
+    a random pair is generated for this run.
+
+    No PSSH is returned — Shaka Packager falls back to emitting a
+    default "common system" PSSH box containing the key IDs, which is
+    enough for a ClearKey player to raise an `encrypted` event and
+    request the key locally, without ever calling EZDRM.
+    """
+
+    override_kid = os.environ.get("CLEARKEY_KEY_ID")
+    override_key = os.environ.get("CLEARKEY_KEY")
+
+    if override_kid and override_key:
+        kid_hex = _validate_clearkey_hex("CLEARKEY_KEY_ID", override_kid)
+        key_hex = _validate_clearkey_hex("CLEARKEY_KEY", override_key)
+
+        logger.info(
+            "Using fixed ClearKey pair from CLEARKEY_KEY_ID/CLEARKEY_KEY for "
+            "content_id=%s — key_id=%s key=%s",
+            content_id,
+            kid_hex,
+            key_hex,
+        )
+    else:
+        kid_hex = uuid.uuid4().hex
+        key_hex = uuid.uuid4().hex
+
+        logger.info(
+            "Generated local ClearKey pair for content_id=%s — key_id=%s key=%s "
+            "(add this to your player's ClearKey config, or set "
+            "CLEARKEY_KEY_ID/CLEARKEY_KEY to pin a fixed key across runs)",
+            content_id,
+            kid_hex,
+            key_hex,
+        )
+
+    return kid_hex, key_hex, None
+
+
 # ---------------- S3 Upload ---------------- #
 
 
@@ -168,8 +225,9 @@ def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple):
             "--enable_raw_key_encryption",
             "--keys",
             f"label=AUDIO:key_id={kid_hex}:key={key_hex}",
-            "--pssh",
-            pssh_hex,
+        ]
+        + (["--pssh", pssh_hex] if pssh_hex else [])
+        + [
             "--protection_scheme",
             "cbcs",
             "--segment_duration",
@@ -199,10 +257,6 @@ def main():
     s3_bucket = os.environ["S3_BUCKET"]
     s3_key = os.environ["S3_KEY"]
 
-    kid_guid = str(uuid.uuid4())
-    ez_user = os.environ["EZDRM_USER"]
-    ez_pass = os.environ["EZDRM_PASS"]
-
     key_parts = s3_key.split("/")
     track_id = key_parts[1]
 
@@ -210,7 +264,16 @@ def main():
 
     logger.info("Processing track %s", track_id)
 
-    drm_keys = fetch_ezdrm_keys(track_id, kid_guid, ez_user, ez_pass)
+    drm_env = os.environ.get("DRM_ENV", "production").lower()
+
+    if drm_env == "development":
+        logger.info("DRM_ENV=development — using local ClearKey keys, skipping EZDRM")
+        drm_keys = generate_clearkey_keys(track_id)
+    else:
+        kid_guid = str(uuid.uuid4())
+        ez_user = os.environ["EZDRM_USER"]
+        ez_pass = os.environ["EZDRM_PASS"]
+        drm_keys = fetch_ezdrm_keys(track_id, kid_guid, ez_user, ez_pass)
 
     with tempfile.TemporaryDirectory() as tmpdir:
 

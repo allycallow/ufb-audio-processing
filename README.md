@@ -22,6 +22,9 @@ For example, `audio/uuid/track.mp3` produces output at `audio/uuid/cmaf/`.
 | `S3_KEY`               | S3 object key of the MP3 (required)  | —       |
 | `CONTENT_ID`           | Unique content identifier (required). Use the Django track ID or another unique string. | — |
 | `DRM_KEY_SERVER_URL`   | DRM key server URL for encryption    | —       |
+| `DRM_ENV`              | Set to `development` to skip EZDRM and package with a ClearKey key_id/key pair instead. Any other value (or unset) uses EZDRM. | `production` |
+| `EZDRM_USER` / `EZDRM_PASS` | EZDRM CPIX API credentials (required unless `DRM_ENV=development`) | — |
+| `CLEARKEY_KEY_ID` / `CLEARKEY_KEY` | Optional, only used when `DRM_ENV=development`. 32 hex-char (16-byte) AES-128 key_id/key to pin across every run. If either is unset, a random pair is generated and logged instead. | — |
 
 ## Local Development
 
