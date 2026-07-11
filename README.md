@@ -14,6 +14,12 @@ Converts MP3 files stored in S3 into Universal CMAF (HLS + DASH) adaptive-bitrat
 
 For example, `audio/uuid/track.mp3` produces output at `audio/uuid/cmaf/`.
 
+## Progress Events
+
+The task publishes progress events to the `production-ufb` EventBridge bus (source `ufb.audio-processing`) as it moves through each stage: `started`, `downloading`, `encoding` (once per ABR variant), `packaging`, `uploading`, `completed`, and `failed`. Each event's detail-type follows the `AudioTrack.<Status>` pattern (e.g. `AudioTrack.Started`, `AudioTrack.Encoding`, `AudioTrack.Failed`). Every event's `Detail` includes `track_id` and `status`, plus stage-specific fields (e.g. `error` on `failed`).
+
+Publishing is best-effort — a failure to reach EventBridge is logged but never fails the task. Set `EVENTBRIDGE_BUS_NAME` to override the target bus (e.g. for local/dev testing). The ECS task role needs `events:PutEvents` on the target bus.
+
 ## Environment Variables
 
 | Variable               | Description                          | Default |

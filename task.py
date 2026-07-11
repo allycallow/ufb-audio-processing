@@ -1,6 +1,7 @@
 import base64
 import binascii
 import contextlib
+import json
 import logging
 import os
 import subprocess
@@ -19,6 +20,10 @@ logger = logging.getLogger("ABR_Packager")
 
 SEGMENT_DURATION = 5
 
+# --- EVENTBRIDGE ---
+EVENT_BUS_NAME = os.environ.get("EVENTBRIDGE_BUS_NAME", "production-ufb")
+EVENT_SOURCE = "ufb.audio-processing"
+
 # ABR ladder
 VARIANTS = [
     {"label": "high", "bitrate": "320k", "bandwidth": 320000},
@@ -35,6 +40,42 @@ def working_directory(path: str):
         yield
     finally:
         os.chdir(original)
+
+
+# ---------------- EventBridge ---------------- #
+
+
+def emit_progress_event(track_id: str, status: str, **detail):
+    """Publish a progress event for this track to EventBridge.
+
+    Best-effort: a failure to publish is logged but never fails the task,
+    since progress tracking shouldn't block audio processing.
+    """
+
+    payload = {"track_id": track_id, "status": status, **detail}
+    detail_type = f"AudioTrack.{status.capitalize()}"
+
+    try:
+        response = boto3.client("events").put_events(
+            Entries=[
+                {
+                    "Source": EVENT_SOURCE,
+                    "DetailType": detail_type,
+                    "Detail": json.dumps(payload),
+                    "EventBusName": EVENT_BUS_NAME,
+                }
+            ]
+        )
+        if response.get("FailedEntryCount"):
+            logger.warning(
+                "EventBridge rejected progress event (status=%s): %s",
+                status,
+                response["Entries"],
+            )
+    except Exception:
+        logger.exception(
+            "Failed to publish progress event to EventBridge (status=%s)", status
+        )
 
 
 # ---------------- DRM ---------------- #
@@ -166,7 +207,7 @@ def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str):
 # ---------------- Packaging ---------------- #
 
 
-def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple):
+def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple, track_id: str):
 
     kid_hex, key_hex, pssh_hex = drm_keys
 
@@ -175,6 +216,7 @@ def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple):
     for v in VARIANTS:
 
         logger.info("Encoding %s variant (%s)", v["label"], v["bitrate"])
+        emit_progress_event(track_id, "encoding", variant=v["label"])
 
         variant_dir = os.path.join(output_dir, v["label"])
         os.makedirs(variant_dir, exist_ok=True)
@@ -243,6 +285,7 @@ def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple):
     )
 
     logger.info("Running Shaka Packager")
+    emit_progress_event(track_id, "packaging")
 
     with working_directory(output_dir):
         subprocess.run(packager_cmd, check=True)
@@ -264,34 +307,46 @@ def main():
     output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
 
     logger.info("Processing track %s", track_id)
+    emit_progress_event(track_id, "started", s3_bucket=s3_bucket, s3_key=s3_key)
 
-    drm_env = os.environ.get("DRM_ENV", "production").lower()
+    try:
+        drm_env = os.environ.get("DRM_ENV", "production").lower()
 
-    if drm_env == "development":
-        logger.info("DRM_ENV=development — using local ClearKey keys, skipping EZDRM")
-        drm_keys = generate_clearkey_keys(track_id)
-    else:
-        kid_guid = str(uuid.uuid4())
-        ez_user = os.environ["EZDRM_USER"]
-        ez_pass = os.environ["EZDRM_PASS"]
-        drm_keys = fetch_ezdrm_keys(track_id, kid_guid, ez_user, ez_pass)
+        if drm_env == "development":
+            logger.info(
+                "DRM_ENV=development — using local ClearKey keys, skipping EZDRM"
+            )
+            drm_keys = generate_clearkey_keys(track_id)
+        else:
+            kid_guid = str(uuid.uuid4())
+            ez_user = os.environ["EZDRM_USER"]
+            ez_pass = os.environ["EZDRM_PASS"]
+            drm_keys = fetch_ezdrm_keys(track_id, kid_guid, ez_user, ez_pass)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
 
-        input_path = os.path.join(tmpdir, "input.wav")
-        output_path = os.path.join(tmpdir, "output")
+            input_path = os.path.join(tmpdir, "input.wav")
+            output_path = os.path.join(tmpdir, "output")
 
-        os.makedirs(output_path)
+            os.makedirs(output_path)
 
-        logger.info("Downloading source from S3")
+            logger.info("Downloading source from S3")
+            emit_progress_event(track_id, "downloading")
 
-        boto3.client("s3").download_file(s3_bucket, s3_key, input_path)
+            boto3.client("s3").download_file(s3_bucket, s3_key, input_path)
 
-        process_abr_cmaf(input_path, output_path, drm_keys)
+            process_abr_cmaf(input_path, output_path, drm_keys, track_id)
 
-        upload_directory_to_s3(output_path, s3_bucket, output_prefix)
+            logger.info("Uploading output to S3")
+            emit_progress_event(track_id, "uploading")
+
+            upload_directory_to_s3(output_path, s3_bucket, output_prefix)
+    except Exception as exc:
+        emit_progress_event(track_id, "failed", error=str(exc))
+        raise
 
     logger.info("ABR packaging task completed successfully")
+    emit_progress_event(track_id, "completed", output_prefix=output_prefix)
 
 
 if __name__ == "__main__":
