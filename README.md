@@ -61,6 +61,7 @@ docker run --rm \
   -e S3_KEY=audio/track.mp3 \
   -e CONTENT_ID=12345 \
   -e DRM_KEY_SERVER_URL=https://drm.example.com \
+  -e AWS_DEFAULT_REGION=eu-west-2 \
   -e AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY \
   -e AWS_SESSION_TOKEN \

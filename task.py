@@ -55,6 +55,8 @@ def emit_progress_event(track_id: str, status: str, **detail):
     payload = {"track_id": track_id, "status": status, **detail}
     detail_type = f"AudioTrack.{status.capitalize()}"
 
+    logger.info("Publishing progress event to EventBridge: %s", payload)
+
     try:
         response = boto3.client("events").put_events(
             Entries=[
@@ -346,7 +348,9 @@ def main():
         raise
 
     logger.info("ABR packaging task completed successfully")
-    emit_progress_event(track_id, "completed", output_prefix=output_prefix)
+    emit_progress_event(
+        track_id, "completed", output_prefix=output_prefix, drm_key_id=drm_keys[0]
+    )
 
 
 if __name__ == "__main__":
