@@ -304,7 +304,7 @@ def main():
     s3_key = os.environ["S3_KEY"]
 
     key_parts = s3_key.split("/")
-    track_id = key_parts[1]
+    track_id = key_parts[2]
 
     output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
 
