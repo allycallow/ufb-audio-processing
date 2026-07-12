@@ -11,12 +11,20 @@ import xml.etree.ElementTree as ET
 
 import boto3
 import requests
+import sentry_sdk
 
 # --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("ABR_Packager")
+
+# --- SENTRY ---
+sentry_dsn = os.environ.get("SENTRY_DSN")
+if sentry_dsn:
+    sentry_sdk.init(
+        dsn=sentry_dsn, environment=os.environ.get("SENTRY_ENVIRONMENT", "production")
+    )
 
 SEGMENT_DURATION = 5
 
@@ -409,6 +417,7 @@ def main():
                 ExtraArgs={"ContentType": "audio/mpeg"},
             )
     except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         emit_progress_event(track_id, "failed", error=str(exc))
         raise
 

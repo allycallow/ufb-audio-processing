@@ -32,6 +32,8 @@ Publishing is best-effort — a failure to reach EventBridge is logged but never
 | `DRM_ENV`              | Set to `development` to skip EZDRM and package with a ClearKey key_id/key pair instead. Any other value (or unset) uses EZDRM. | `production` |
 | `EZDRM_USER` / `EZDRM_PASS` | EZDRM CPIX API credentials (required unless `DRM_ENV=development`) | — |
 | `CLEARKEY_KEY_ID` / `CLEARKEY_KEY` | Optional, only used when `DRM_ENV=development`. 32 hex-char (16-byte) AES-128 key_id/key to pin across every run. If either is unset, a random pair is generated and logged instead. | — |
+| `SENTRY_DSN`           | Sentry DSN for error reporting. If unset, Sentry is not initialized. | — |
+| `SENTRY_ENVIRONMENT`   | Environment tag sent to Sentry.      | `production` |
 
 ## Local Development
 
