@@ -206,6 +206,60 @@ def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str):
             s3.upload_file(local_path, bucket, s3_key, ExtraArgs={"ContentType": ct})
 
 
+# ---------------- Preview ---------------- #
+
+
+def generate_preview(wav_path: str, preview_path: str, track_id: str):
+    """Encode a 30s unencrypted MP3 preview centered on the track's midpoint."""
+
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            wav_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    duration = float(probe.stdout.strip())
+    start = max(0.0, duration / 2 - 15)
+
+    logger.info("Generating 30s preview (start=%.1fs)", start)
+    emit_progress_event(track_id, "preview")
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start),
+            "-i",
+            wav_path,
+            "-t",
+            "30",
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "96k",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            preview_path,
+        ],
+        check=True,
+    )
+
+
 # ---------------- Packaging ---------------- #
 
 
@@ -329,6 +383,7 @@ def main():
 
             input_path = os.path.join(tmpdir, "input.wav")
             output_path = os.path.join(tmpdir, "output")
+            preview_path = os.path.join(tmpdir, "preview.mp3")
 
             os.makedirs(output_path)
 
@@ -338,18 +393,32 @@ def main():
             boto3.client("s3").download_file(s3_bucket, s3_key, input_path)
 
             process_abr_cmaf(input_path, output_path, drm_keys, track_id)
+            generate_preview(input_path, preview_path, track_id)
 
             logger.info("Uploading output to S3")
             emit_progress_event(track_id, "uploading")
 
             upload_directory_to_s3(output_path, s3_bucket, output_prefix)
+
+            preview_key = "/".join(key_parts[:-1]) + "/preview.mp3"
+            logger.info("Uploading preview to s3://%s/%s", s3_bucket, preview_key)
+            boto3.client("s3").upload_file(
+                preview_path,
+                s3_bucket,
+                preview_key,
+                ExtraArgs={"ContentType": "audio/mpeg"},
+            )
     except Exception as exc:
         emit_progress_event(track_id, "failed", error=str(exc))
         raise
 
     logger.info("ABR packaging task completed successfully")
     emit_progress_event(
-        track_id, "completed", output_prefix=output_prefix, drm_key_id=drm_keys[0]
+        track_id,
+        "completed",
+        output_prefix=output_prefix,
+        drm_key_id=drm_keys[0],
+        preview_key=preview_key,
     )
 
 

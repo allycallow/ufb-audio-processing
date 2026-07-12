@@ -10,13 +10,14 @@ Converts MP3 files stored in S3 into Universal CMAF (HLS + DASH) adaptive-bitrat
   - **mid** — 192 kbps
   - **high** — 320 kbps
 3. Packages and encrypts the variants into Universal CMAF (HLS + DASH) using Shaka Packager, with FairPlay and Widevine DRM.
-4. Uploads the CMAF output directory back to S3 alongside the original file.
+4. Encodes a 30s unencrypted MP3 preview (96 kbps), centered on the track's midpoint.
+5. Uploads the CMAF output directory and the preview file back to S3 alongside the original file.
 
-For example, `audio/uuid/track.mp3` produces output at `audio/uuid/cmaf/`.
+For example, `audio/uuid/track.mp3` produces output at `audio/uuid/cmaf/` and `audio/uuid/preview.mp3`.
 
 ## Progress Events
 
-The task publishes progress events to the `production-ufb` EventBridge bus (source `ufb.audio-processing`) as it moves through each stage: `started`, `downloading`, `encoding` (once per ABR variant), `packaging`, `uploading`, `completed`, and `failed`. Each event's detail-type follows the `AudioTrack.<Status>` pattern (e.g. `AudioTrack.Started`, `AudioTrack.Encoding`, `AudioTrack.Failed`). Every event's `Detail` includes `track_id` and `status`, plus stage-specific fields (e.g. `error` on `failed`).
+The task publishes progress events to the `production-ufb` EventBridge bus (source `ufb.audio-processing`) as it moves through each stage: `started`, `downloading`, `encoding` (once per ABR variant), `packaging`, `preview`, `uploading`, `completed`, and `failed`. Each event's detail-type follows the `AudioTrack.<Status>` pattern (e.g. `AudioTrack.Started`, `AudioTrack.Encoding`, `AudioTrack.Failed`). Every event's `Detail` includes `track_id` and `status`, plus stage-specific fields (e.g. `error` on `failed`, `preview_key` on `completed`).
 
 Publishing is best-effort — a failure to reach EventBridge is logged but never fails the task. Set `EVENTBRIDGE_BUS_NAME` to override the target bus (e.g. for local/dev testing). The ECS task role needs `events:PutEvents` on the target bus.
 
