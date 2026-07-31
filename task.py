@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 import boto3
 import requests
 import sentry_sdk
+from confluent_kafka import Producer
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -31,6 +32,12 @@ SEGMENT_DURATION = 5
 # --- EVENTBRIDGE ---
 EVENT_BUS_NAME = os.environ.get("EVENTBRIDGE_BUS_NAME", "production-ufb")
 EVENT_SOURCE = "ufb.audio-processing"
+
+# --- KAFKA ---
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS")
+KAFKA_TRACK_PROCESSING_EVENTS_TOPIC = os.environ.get(
+    "KAFKA_TRACK_PROCESSING_EVENTS_TOPIC", "ufb.track_processing_events"
+)
 
 # ABR ladder
 VARIANTS = [
@@ -86,6 +93,47 @@ def emit_progress_event(track_id: str, status: str, **detail):
         logger.exception(
             "Failed to publish progress event to EventBridge (status=%s)", status
         )
+
+
+# ---------------- Kafka ---------------- #
+
+_kafka_producer = None
+
+
+def _get_kafka_producer() -> Producer:
+    global _kafka_producer
+    if _kafka_producer is None:
+        _kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
+    return _kafka_producer
+
+
+def emit_saga_result(
+    track_id: str, status: str, data: dict | None = None, error: str | None = None
+):
+    """Publish this track's final audio-encoding result to Kafka for
+    TrackIngestionSagaWorkflow to react to (see ufb-temporal-worker's
+    reply_listener.py, which signals the saga and is what actually writes
+    the result to Django). Best-effort: a failure to publish is logged but
+    never fails the task — the saga's own result-timeout is the backstop.
+    """
+    payload = {"track_id": track_id, "step": "audio", "status": status}
+    if data is not None:
+        payload["data"] = data
+    if error is not None:
+        payload["error"] = error
+
+    logger.info("Publishing saga result to Kafka: %s", payload)
+
+    try:
+        producer = _get_kafka_producer()
+        producer.produce(
+            topic=KAFKA_TRACK_PROCESSING_EVENTS_TOPIC,
+            key=track_id.encode("utf-8"),
+            value=json.dumps(payload).encode("utf-8"),
+        )
+        producer.flush(timeout=10)
+    except Exception:
+        logger.exception("Failed to publish saga result to Kafka (status=%s)", status)
 
 
 # ---------------- DRM ---------------- #
@@ -418,16 +466,18 @@ def main():
             )
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
-        emit_progress_event(track_id, "failed", error=str(exc))
+        emit_saga_result(track_id, "failed", error=str(exc))
         raise
 
     logger.info("ABR packaging task completed successfully")
-    emit_progress_event(
+    emit_saga_result(
         track_id,
-        "completed",
-        output_prefix=output_prefix,
-        drm_key_id=drm_keys[0],
-        preview_key=preview_key,
+        "success",
+        data={
+            "output_prefix": output_prefix,
+            "drm_key_id": drm_keys[0],
+            "preview_key": preview_key,
+        },
     )
 
 

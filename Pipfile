@@ -5,6 +5,7 @@ name = "pypi"
 
 [packages]
 sentry-sdk = "==2.64.0"
+confluent-kafka = "*"
 
 [dev-packages]
 flake8 = "*"
