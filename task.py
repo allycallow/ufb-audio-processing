@@ -262,6 +262,26 @@ def upload_directory_to_s3(local_dir: str, bucket: str, prefix: str):
             s3.upload_file(local_path, bucket, s3_key, ExtraArgs={"ContentType": ct})
 
 
+def tag_wav_for_archival(bucket: str, key: str):
+    """Tag the source WAV archive-tier=source so the media bucket's lifecycle
+    rule (modules/storage in ufb-iac) can transition it to Glacier Deep
+    Archive. Only called once the CMAF/DRM output has been uploaded
+    successfully, so a WAV never goes cold before we're done needing it.
+
+    Best-effort: a failure here shouldn't fail the track, it just means this
+    one WAV stays in Standard until a manual retag.
+    """
+
+    try:
+        boto3.client("s3").put_object_tagging(
+            Bucket=bucket,
+            Key=key,
+            Tagging={"TagSet": [{"Key": "archive-tier", "Value": "source"}]},
+        )
+    except Exception:
+        logger.exception("Failed to tag source WAV for archival: s3://%s/%s", bucket, key)
+
+
 # ---------------- Preview ---------------- #
 
 
@@ -464,6 +484,8 @@ def main():
                 preview_key,
                 ExtraArgs={"ContentType": "audio/mpeg"},
             )
+
+            tag_wav_for_archival(s3_bucket, s3_key)
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
         emit_saga_result(track_id, "failed", error=str(exc))
