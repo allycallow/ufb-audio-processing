@@ -13,6 +13,7 @@ import boto3
 import requests
 import sentry_sdk
 from confluent_kafka import Producer
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -45,6 +46,10 @@ VARIANTS = [
     {"label": "med", "bitrate": "192k", "bandwidth": 192000},
     {"label": "low", "bitrate": "64k", "bandwidth": 64000},
 ]
+
+# Matches VARIANTS[0] ("high") - downloads get the same quality subscribers
+# already stream, just as a single flat file instead of chunked HLS.
+DOWNLOAD_BITRATE = VARIANTS[0]["bitrate"]
 
 
 @contextlib.contextmanager
@@ -336,6 +341,83 @@ def generate_preview(wav_path: str, preview_path: str, track_id: str):
     )
 
 
+# ---------------- Download (offline, app-encrypted) ---------------- #
+
+
+def generate_download(wav_path: str, output_path: str, track_id: str):
+    """Encode a full-length AAC download asset.
+
+    Structurally identical to one iteration of process_abr_cmaf's per-variant
+    encode, but un-trimmed (unlike generate_preview) and never touches Shaka
+    Packager - this is played back as a single whole file on-device, not
+    streamed in segments, and it's protected by app-level AES-GCM encryption
+    (see encrypt_download_asset) rather than Shaka's DRM packaging.
+    """
+
+    logger.info("Encoding download asset (%s)", DOWNLOAD_BITRATE)
+    emit_progress_event(track_id, "download_encoding")
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            wav_path,
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            DOWNLOAD_BITRATE,
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            output_path,
+        ],
+        check=True,
+    )
+
+
+def encrypt_download_asset(plaintext_path: str, ciphertext_path: str) -> bytes:
+    """AES-256-GCM encrypt a download asset in place.
+
+    Writes nonce(12) || ciphertext || tag(16) to ciphertext_path -
+    AESGCM.encrypt() already appends the tag, so prepending the nonce
+    ourselves produces exactly the "combined" layout expo-crypto's
+    aesDecryptAsync expects on the client. Returns the raw key; callers must
+    wrap it with wrap_content_key() and discard it immediately - it is never
+    logged or persisted unwrapped.
+    """
+
+    key = AESGCM.generate_key(bit_length=256)
+    nonce = os.urandom(12)
+
+    with open(plaintext_path, "rb") as f:
+        plaintext = f.read()
+
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
+
+    with open(ciphertext_path, "wb") as f:
+        f.write(nonce + ciphertext)
+
+    return key
+
+
+def wrap_content_key(key: bytes) -> str:
+    """KMS-wrap a raw content key for storage.
+
+    A key-wrapping step only, not full envelope encryption - only the small
+    raw key, never the audio file itself, touches KMS.
+    """
+
+    response = boto3.client("kms").encrypt(
+        KeyId=os.environ["DOWNLOAD_CONTENT_KEYS_KMS_KEY_ID"], Plaintext=key
+    )
+    return base64.b64encode(response["CiphertextBlob"]).decode("ascii")
+
+
 # ---------------- Packaging ---------------- #
 
 
@@ -460,6 +542,8 @@ def main():
             input_path = os.path.join(tmpdir, "input.wav")
             output_path = os.path.join(tmpdir, "output")
             preview_path = os.path.join(tmpdir, "preview.mp3")
+            download_plain_path = os.path.join(tmpdir, "download.m4a")
+            download_cipher_path = os.path.join(tmpdir, "download.enc")
 
             os.makedirs(output_path)
 
@@ -470,6 +554,13 @@ def main():
 
             process_abr_cmaf(input_path, output_path, drm_keys, track_id)
             generate_preview(input_path, preview_path, track_id)
+
+            generate_download(input_path, download_plain_path, track_id)
+            raw_download_key = encrypt_download_asset(
+                download_plain_path, download_cipher_path
+            )
+            download_encryption_key_ciphertext = wrap_content_key(raw_download_key)
+            del raw_download_key
 
             logger.info("Uploading output to S3")
             emit_progress_event(track_id, "uploading")
@@ -483,6 +574,17 @@ def main():
                 s3_bucket,
                 preview_key,
                 ExtraArgs={"ContentType": "audio/mpeg"},
+            )
+
+            download_output_key = "/".join(key_parts[:-1]) + "/download.enc"
+            logger.info(
+                "Uploading download asset to s3://%s/%s", s3_bucket, download_output_key
+            )
+            boto3.client("s3").upload_file(
+                download_cipher_path,
+                s3_bucket,
+                download_output_key,
+                ExtraArgs={"ContentType": "application/octet-stream"},
             )
 
             tag_wav_for_archival(s3_bucket, s3_key)
@@ -499,6 +601,8 @@ def main():
             "output_prefix": output_prefix,
             "drm_key_id": drm_keys[0],
             "preview_key": preview_key,
+            "download_output_key": download_output_key,
+            "download_encryption_key_ciphertext": download_encryption_key_ciphertext,
         },
     )
 
