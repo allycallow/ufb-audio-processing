@@ -516,8 +516,18 @@ def main():
     s3_key = os.environ["S3_KEY"]
 
     key_parts = s3_key.split("/")
-    track_id = key_parts[2]
+    # TRACK_ID is passed explicitly by every known caller now (see
+    # ufb-temporal-worker's activities/track_ingestion.py); key_parts[2]
+    # remains only as a fallback for anything invoking this task without it.
+    track_id = os.environ.get("TRACK_ID") or key_parts[2]
 
+    # Output (CMAF/preview/download) always goes to this bucket - explicit,
+    # rather than defaulting to S3_BUCKET, since for a DDEX-triggered run
+    # S3_BUCKET is the DDEX delivery bucket (KMS/VPC-restricted, not
+    # CloudFront's origin), not the media bucket output actually belongs in.
+    # Falls back to S3_BUCKET so a caller that never sets this (none do
+    # today) still gets the pre-existing same-bucket behavior.
+    output_bucket = os.environ.get("OUTPUT_BUCKET", s3_bucket)
     output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
 
     logger.info("Processing track %s", track_id)
@@ -565,29 +575,38 @@ def main():
             logger.info("Uploading output to S3")
             emit_progress_event(track_id, "uploading")
 
-            upload_directory_to_s3(output_path, s3_bucket, output_prefix)
+            upload_directory_to_s3(output_path, output_bucket, output_prefix)
 
             preview_key = "/".join(key_parts[:-1]) + "/preview.mp3"
-            logger.info("Uploading preview to s3://%s/%s", s3_bucket, preview_key)
+            logger.info("Uploading preview to s3://%s/%s", output_bucket, preview_key)
             boto3.client("s3").upload_file(
                 preview_path,
-                s3_bucket,
+                output_bucket,
                 preview_key,
                 ExtraArgs={"ContentType": "audio/mpeg"},
             )
 
             download_output_key = "/".join(key_parts[:-1]) + "/download.enc"
             logger.info(
-                "Uploading download asset to s3://%s/%s", s3_bucket, download_output_key
+                "Uploading download asset to s3://%s/%s",
+                output_bucket,
+                download_output_key,
             )
             boto3.client("s3").upload_file(
                 download_cipher_path,
-                s3_bucket,
+                output_bucket,
                 download_output_key,
                 ExtraArgs={"ContentType": "application/octet-stream"},
             )
 
-            tag_wav_for_archival(s3_bucket, s3_key)
+            # The media bucket's own lifecycle rule this tags for doesn't
+            # apply to a source bucket other than the media bucket itself
+            # (e.g. the DDEX delivery bucket, which has its own, separate
+            # archival rule - see modules/ddex-delivery in ufb-iac) - and
+            # audio-processing's task role has no PutObjectTagging grant
+            # there anyway, only GetObject.
+            if s3_bucket == output_bucket:
+                tag_wav_for_archival(s3_bucket, s3_key)
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
         emit_saga_result(track_id, "failed", error=str(exc))
