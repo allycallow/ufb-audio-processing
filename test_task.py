@@ -40,3 +40,22 @@ def test_wrap_content_key_round_trips_through_kms(monkeypatch):
     ciphertext_blob = base64.b64decode(wrapped_b64)
     decrypted = kms.decrypt(CiphertextBlob=ciphertext_blob)["Plaintext"]
     assert decrypted == raw_key
+
+
+def test_output_dir_is_unchanged_for_a_manual_upload():
+    track_id = "0100c3ca-b789-4da1-b460-f3e9d3458162"
+    s3_key = f"production-ufb-media/audio/{track_id}/{track_id}.wav"
+
+    assert task.output_dir_for(s3_key, track_id) == (
+        f"production-ufb-media/audio/{track_id}"
+    )
+
+
+def test_output_dir_is_per_track_for_tracks_sharing_a_ddex_resources_folder():
+    resources = "partners/rr-digital/RR0506/resources"
+
+    first = task.output_dir_for(f"{resources}/track-1.wav", "track-id-1")
+    second = task.output_dir_for(f"{resources}/track-2.wav", "track-id-2")
+
+    assert first == f"{resources}/track-id-1"
+    assert second == f"{resources}/track-id-2"

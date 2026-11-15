@@ -507,6 +507,19 @@ def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple, track_id: 
     logger.info("Packaging completed")
 
 
+def output_dir_for(s3_key: str, track_id: str) -> str:
+    """Where this track's CMAF/preview/download output goes - the source
+    file's own folder, which for a manual upload (audio/<track_id>/...) is
+    already per-track. A DDEX delivery's resources/ folder is shared by every
+    track in the release, so output there gets its own <track_id> subfolder,
+    or each track's encode would overwrite the others'.
+    """
+    source_dir = "/".join(s3_key.split("/")[:-1])
+    if source_dir.split("/")[-1] == track_id:
+        return source_dir
+    return f"{source_dir}/{track_id}"
+
+
 # ---------------- Main ---------------- #
 
 
@@ -528,7 +541,8 @@ def main():
     # Falls back to S3_BUCKET so a caller that never sets this (none do
     # today) still gets the pre-existing same-bucket behavior.
     output_bucket = os.environ.get("OUTPUT_BUCKET", s3_bucket)
-    output_prefix = "/".join(key_parts[:-1]) + "/cmaf"
+    output_dir = output_dir_for(s3_key, track_id)
+    output_prefix = f"{output_dir}/cmaf"
 
     logger.info("Processing track %s", track_id)
     emit_progress_event(track_id, "started", s3_bucket=s3_bucket, s3_key=s3_key)
@@ -577,7 +591,7 @@ def main():
 
             upload_directory_to_s3(output_path, output_bucket, output_prefix)
 
-            preview_key = "/".join(key_parts[:-1]) + "/preview.mp3"
+            preview_key = f"{output_dir}/preview.mp3"
             logger.info("Uploading preview to s3://%s/%s", output_bucket, preview_key)
             boto3.client("s3").upload_file(
                 preview_path,
@@ -586,7 +600,7 @@ def main():
                 ExtraArgs={"ContentType": "audio/mpeg"},
             )
 
-            download_output_key = "/".join(key_parts[:-1]) + "/download.enc"
+            download_output_key = f"{output_dir}/download.enc"
             logger.info(
                 "Uploading download asset to s3://%s/%s",
                 output_bucket,
