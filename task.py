@@ -507,17 +507,19 @@ def process_abr_cmaf(wav_path: str, output_dir: str, drm_keys: tuple, track_id: 
     logger.info("Packaging completed")
 
 
-def output_dir_for(s3_key: str, track_id: str) -> str:
-    """Where this track's CMAF/preview/download output goes - the source
-    file's own folder, which for a manual upload (audio/<track_id>/...) is
-    already per-track. A DDEX delivery's resources/ folder is shared by every
-    track in the release, so output there gets its own <track_id> subfolder,
-    or each track's encode would overwrite the others'.
+def output_dir_for(track_id: str) -> str:
+    """Where this track's CMAF/preview/download output goes - always
+    audio/<track_id>/ under the media bucket's production-ufb-media/ prefix,
+    which is CloudFront's origin path. The backend builds playback URLs as
+    CDN_AUDIO_BASE/<track_id>/... from the track ID alone, not from the keys
+    reported here, so output anywhere else can't be played.
+
+    A manual upload's source already lives in that folder. A DDEX delivery's
+    doesn't - its resources/ folder is shared by every track in the release
+    and sits outside CloudFront's origin path - so it can't be derived from
+    S3_KEY.
     """
-    source_dir = "/".join(s3_key.split("/")[:-1])
-    if source_dir.split("/")[-1] == track_id:
-        return source_dir
-    return f"{source_dir}/{track_id}"
+    return f"production-ufb-media/audio/{track_id}"
 
 
 # ---------------- Main ---------------- #
@@ -541,7 +543,7 @@ def main():
     # Falls back to S3_BUCKET so a caller that never sets this (none do
     # today) still gets the pre-existing same-bucket behavior.
     output_bucket = os.environ.get("OUTPUT_BUCKET", s3_bucket)
-    output_dir = output_dir_for(s3_key, track_id)
+    output_dir = output_dir_for(track_id)
     output_prefix = f"{output_dir}/cmaf"
 
     logger.info("Processing track %s", track_id)

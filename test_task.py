@@ -46,16 +46,12 @@ def test_output_dir_is_unchanged_for_a_manual_upload():
     track_id = "0100c3ca-b789-4da1-b460-f3e9d3458162"
     s3_key = f"production-ufb-media/audio/{track_id}/{track_id}.wav"
 
-    assert task.output_dir_for(s3_key, track_id) == (
-        f"production-ufb-media/audio/{track_id}"
-    )
+    assert task.output_dir_for(track_id) == "/".join(s3_key.split("/")[:-1])
 
 
-def test_output_dir_is_per_track_for_tracks_sharing_a_ddex_resources_folder():
-    resources = "partners/rr-digital/RR0506/resources"
-
-    first = task.output_dir_for(f"{resources}/track-1.wav", "track-id-1")
-    second = task.output_dir_for(f"{resources}/track-2.wav", "track-id-2")
-
-    assert first == f"{resources}/track-id-1"
-    assert second == f"{resources}/track-id-2"
+def test_output_dir_is_per_track_under_audio_for_a_ddex_delivery():
+    # Every track in a release shares one DDEX resources/ folder, but its
+    # output has to land where the CDN and backend look for it -
+    # audio/<track_id>/ - not alongside the source.
+    assert task.output_dir_for("track-id-1") == "production-ufb-media/audio/track-id-1"
+    assert task.output_dir_for("track-id-2") == "production-ufb-media/audio/track-id-2"
